@@ -1,0 +1,278 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
+
+// Pin 
+#define GPS_RX_PIN D6
+#define GPS_TX_PIN D5
+#define BUZZER_CTRL_PIN D1
+
+// WiFi 
+const char *ssid = "Kiss me";
+const char *password = "Emiliya0608";
+
+//3.068860, 101.498140 (ptar uitm)
+// Google Apps Script URL
+const char *googleScriptURL = "https://script.google.com/macros/s/AKfycbxD5KiDTbjqEZrjp-UnGANamEv02w2h5WgdEpwEX4VdppjwhGpxXGmC6e03fjZ2H7Kzgg/exec";
+
+// Geofence Parameters
+const double FENCE_LAT = 3.073364;
+const double FENCE_LON = 101.497519;
+const double FENCE_RADIUS_METERS = 20.0;
+
+// Timing Constants
+const unsigned long SEND_INTERVAL = 10000;
+const unsigned long GPS_TIMEOUT = 5000;
+const unsigned long WIFI_RETRY_INTERVAL = 10000;
+const unsigned long GPS_TIMEOUT_MESSAGE_INTERVAL = 1000;
+
+SoftwareSerial gpsSerial(GPS_RX_PIN, GPS_TX_PIN);
+TinyGPSPlus gps;
+
+// State Variables
+bool wasInsideFence = true;
+bool buzzerActive = false;
+bool wifiConnected = false;
+unsigned long lastPositionUpdate = 0;
+unsigned long lastDataSend = 0;
+unsigned long lastWiFiRetry = 0;
+unsigned long lastGpsTimeoutMessage = 0;
+
+// Function declarations
+void beep(unsigned int duration);
+void connectWiFi();
+void manageWiFiConnection();
+void processGPSData();
+void displayStatus();
+float calculateDistance();
+void checkGeofence();
+void onEnterGeofence();
+void onExitGeofence(float distance);
+void startBuzzer();
+void stopBuzzer();
+void updateBuzzer();
+bool sendGPSData();
+void handleGeofenceAndTransmission();
+void monitorSystemStatus();
+void handleGpsTimeout();
+
+void setup() {
+  Serial.begin(9600);
+  gpsSerial.begin(9600);
+  pinMode(BUZZER_CTRL_PIN, OUTPUT);
+
+  // Startup beeps
+  beep(100); delay(100); beep(100); delay(100); beep(100);
+  
+  connectWiFi();
+  
+  Serial.println("\n20m Radius Geofence Monitoring - ESP8266");
+  Serial.printf("Center: %.6f, %.6f\n", FENCE_LAT, FENCE_LON);
+  Serial.printf("Radius: %.1f meters\n", FENCE_RADIUS_METERS);
+  Serial.println("System initialized");
+}
+
+void loop() {
+  manageWiFiConnection();
+  processGPSData();
+  handleGeofenceAndTransmission();
+  monitorSystemStatus();
+}
+
+// Buzzer Functions
+void beep(unsigned int duration) {
+  digitalWrite(BUZZER_CTRL_PIN, HIGH);
+  delay(duration);
+  digitalWrite(BUZZER_CTRL_PIN, LOW);
+}
+
+void startBuzzer() {
+  buzzerActive = true;
+  for (int i = 0; i < 3; i++) {
+    beep(150); delay(100);
+  }
+}
+
+void stopBuzzer() {
+  buzzerActive = false;
+  digitalWrite(BUZZER_CTRL_PIN, LOW);
+}
+
+void updateBuzzer() {
+  static unsigned long lastBeep = 0;
+  if (buzzerActive && millis() - lastBeep > 2000) {
+    beep(300);
+    lastBeep = millis();
+  }
+}
+
+// WiFi Functions
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    return;
+  }
+
+  Serial.println("Connecting to WiFi...");
+  WiFi.disconnect();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
+    delay(250);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    wifiConnected = false;
+    Serial.println("\nWiFi connection failed");
+  }
+}
+
+void manageWiFiConnection() {
+  if (!wifiConnected && millis() - lastWiFiRetry > WIFI_RETRY_INTERVAL) {
+    connectWiFi();
+    lastWiFiRetry = millis();
+  }
+}
+
+// GPS Functions
+void processGPSData() {
+  while (gpsSerial.available() > 0) {
+    if (gps.encode(gpsSerial.read())) {
+      lastPositionUpdate = millis();
+      if (gps.location.isValid()) {
+        displayStatus();
+      }
+    }
+  }
+}
+
+void displayStatus() {
+  Serial.printf("Position: %.6f, %.6f", gps.location.lat(), gps.location.lng());
+  Serial.printf(" | Distance: %.1fm", calculateDistance());
+  
+  Serial.print(" | Speed: ");
+  if (gps.speed.isValid()) {
+    Serial.printf("%.1f km/h", gps.speed.kmph());
+  } else {
+    Serial.print("N/A");
+  }
+  
+  Serial.printf(" | %s\n", calculateDistance() <= FENCE_RADIUS_METERS ? "INSIDE" : "OUTSIDE");
+}
+
+// Geofence Functions
+float calculateDistance() {
+  return TinyGPSPlus::distanceBetween(
+    gps.location.lat(),
+    gps.location.lng(),
+    FENCE_LAT,
+    FENCE_LON
+  );
+}
+
+void checkGeofence() {
+  float distance = calculateDistance();
+  bool isInside = (distance <= FENCE_RADIUS_METERS);
+
+  if (isInside != wasInsideFence) {
+    if (isInside) {
+      onEnterGeofence();
+    } else {
+      onExitGeofence(distance);
+    }
+    wasInsideFence = isInside;
+  }
+}
+
+void onEnterGeofence() {
+  Serial.println(">> ENTERED 20m zone <<");
+  stopBuzzer();
+  beep(100); delay(100); beep(100);
+}
+
+void onExitGeofence(float distance) {
+  Serial.printf(">> LEFT zone! Distance: %.1fm <<\n", distance);
+  startBuzzer();
+}
+
+// Data Transmission
+bool sendGPSData() {
+  if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, cannot send data");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  HTTPClient http;
+  
+  client.setInsecure(); // Bypass SSL verification
+  client.setTimeout(10000); // 10 second timeout
+
+  // Build URL with parameters that match your Google Script
+  String url = String(googleScriptURL);
+  url += "?type=gps"; // Must match your Google Script's expected parameter
+  url += "&lat=" + String(gps.location.lat(), 6);
+  url += "&lon=" + String(gps.location.lng(), 6);
+  url += "&speed=" + String(gps.speed.isValid() ? gps.speed.kmph() : 0.0, 1);
+  url += "&dist=" + String(calculateDistance(), 1);
+  url += "&status=" + String(calculateDistance() <= FENCE_RADIUS_METERS ? "INSIDE" : "OUTSIDE");
+
+  Serial.println("Sending data to: " + url);
+
+  if (http.begin(client, url)) {
+    int httpCode = http.GET();
+    
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      Serial.println("Server response: " + payload);
+      http.end();
+      return true;
+    } else {
+      Serial.printf("HTTP error: %d - %s\n", httpCode, http.errorToString(httpCode).c_str());
+      http.end();
+      wifiConnected = false;
+      return false;
+    }
+  }
+  return false;
+}
+
+void handleGeofenceAndTransmission() {
+  if (gps.location.isValid()) {
+    checkGeofence();
+    
+    if (millis() - lastDataSend > SEND_INTERVAL && wifiConnected) {
+      if (sendGPSData()) {
+        lastDataSend = millis();
+      }
+    }
+  }
+}
+
+// System Monitoring
+void monitorSystemStatus() {
+  if (millis() - lastPositionUpdate > GPS_TIMEOUT) {
+    handleGpsTimeout();
+  } else {
+    // Reset the timeout message timer when GPS is active
+    lastGpsTimeoutMessage = millis();
+  }
+  updateBuzzer();
+}
+
+void handleGpsTimeout() {
+  if (millis() - lastGpsTimeoutMessage >= GPS_TIMEOUT_MESSAGE_INTERVAL) {
+    Serial.println("GPS SIGNAL LOST!");
+    lastGpsTimeoutMessage = millis();
+  }
+}
